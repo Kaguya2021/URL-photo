@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import http from 'http'; // Импортируем модуль http для веб-сервера
 
 // Инициализируем переменные окружения из файла .env
 dotenv.config();
@@ -39,6 +40,34 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+// =================== ВЕБ-СЕРВЕР И ПИНГОВАЛКА ДЛЯ RENDER ===================
+const PORT = process.env.PORT || 3000;
+const APP_URL = process.env.RENDER_EXTERNAL_URL; // Создается хостингом Render автоматически
+
+// 1. Создаем простейший HTTP-сервер, чтобы Render успешно проходил проверку портов (Port Binding)
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running and alive!');
+}).listen(PORT, () => {
+    console.log(`[Пинговалка] Веб-сервер успешно запущен на порту ${PORT}`);
+});
+
+// 2. Цикл самопинга: раз в 10 минут отправляем запрос на собственный URL
+if (APP_URL) {
+    setInterval(async () => {
+        try {
+            const response = await fetch(APP_URL);
+            console.log(`[Пинг] Успешный самопинг. Статус: ${response.status}`);
+        } catch (error) {
+            console.error('[Пинг] Ошибка при самопинге:', error.message);
+        }
+    }, 600000); // 600 000 мс = 10 минут
+    console.log(`[Пинговалка] Таймер самопинга запущен для: ${APP_URL}`);
+} else {
+    console.log('[Пинговалка] RENDER_EXTERNAL_URL не найден. На локальном компьютере пинг отключен.');
+}
+// ==========================================================================
+
 // 1. Обработка команды /start с красивой HTML-разметкой
 bot.command('start', async (ctx) => {
     const welcomeMessage = 
@@ -72,12 +101,12 @@ bot.on(['photo', 'document'], async (ctx) => {
             return ctx.reply('❌ Пожалуйста, отправьте фотографию или файл изображения.');
         }
     } else {
-        // Если отправлено как фото, Telegram сжимает его и отдаёт массив вариантов. Берем самый крупный.
+        // Если отправлено как фото, берем самый крупный вариант из массива
         const photoArray = ctx.message.photo;
         const largestPhoto = photoArray[photoArray.length - 1];
         fileId = largestPhoto.file_id;
         fileSize = largestPhoto.file_size;
-        fileExt = 'jpg'; // Сжатые фото Telegram всегда приводит к JPG
+        fileExt = 'jpg'; // Telegram всегда сжимает фото в JPG
     }
 
     // 4. Отправка сообщения о начале загрузки
@@ -88,10 +117,10 @@ bot.on(['photo', 'document'], async (ctx) => {
     const tempFilePath = path.join(UPLOADS_DIR, `${fileId}.${fileExt}`);
 
     try {
-        // Получаем прямую ссылку на скачивание файла с серверов Telegram
+        // Получаем прямую ссылку на файл с серверов Telegram
         const fileLink = await ctx.telegram.getFileLink(fileId);
         
-        // Скачиваем файл во временную директорию
+        // Скачиваем файл во временную директорию бота
         const response = await fetch(fileLink.href);
         if (!response.ok) throw new Error('Не удалось скачать файл из Telegram');
         
@@ -99,7 +128,7 @@ bot.on(['photo', 'document'], async (ctx) => {
         const buffer = Buffer.from(arrayBuffer);
         await fs.writeFile(tempFilePath, buffer);
 
-        // Формируем FormData для отправки в облачное хранилище tmpfiles.org
+        // Формируем FormData для отправки на tmpfiles.org
         const formData = new FormData();
         const fileBlob = new Blob([buffer], { type: mimeType });
         formData.append('file', fileBlob, fileName);
@@ -114,11 +143,11 @@ bot.on(['photo', 'document'], async (ctx) => {
 
         const uploadData = await uploadResponse.json();
         
-        // Трансформируем обычную ссылку просмотра в прямую ссылку скачивания (добавляем /dl/)
+        // Превращаем ссылку просмотра в прямую ссылку для скачивания (добавляем /dl/)
         const viewUrl = uploadData.data.url;
         const directLink = viewUrl.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
 
-        // Форматируем метаданные для ответа
+        // Форматируем метаданные
         const formattedSize = formatBytes(fileSize);
         const formattedFormat = fileExt.toUpperCase();
 
@@ -129,7 +158,7 @@ bot.on(['photo', 'document'], async (ctx) => {
             `📦 <b>Размер:</b> ${formattedSize}\n\n` +
             `🔗 <b>Прямая ссылка:</b>\n${directLink}`;
 
-        // Изменяем текст загрузочного сообщения на финальный результат
+        // Изменяем текст загрузочного сообщения на результат
         await ctx.telegram.editMessageText(
             ctx.chat.id,
             loadingMessage.message_id,
@@ -141,24 +170,24 @@ bot.on(['photo', 'document'], async (ctx) => {
     } catch (error) {
         console.error('Ошибка в процессе обработки:', error);
 
-        // 6. Если произошла ошибка, уведомляем пользователя и убираем лоадер
+        // 6. Ошибка — уведомляем пользователя и удаляем лоадер
         try {
             await ctx.telegram.deleteMessage(ctx.chat.id, loadingMessage.message_id);
         } catch (delError) {
-            // Игнорируем ошибку удаления, если сообщение уже пропало
+            // Игнорируем ошибку удаления, если сообщение уже удалено
         }
         await ctx.reply('❌ Произошла ошибка при загрузке изображения. Попробуйте позже.');
     } finally {
-        // Обязательно очищаем за собой локальный файл, чтобы не забивать диск
+        // Обязательно удаляем локальный временный файл
         try {
             await fs.unlink(tempFilePath);
         } catch (err) {
-            // Файл мог не создаться, если падение произошло до записи
+            // Файл мог не создаться, если ошибка произошла до записи
         }
     }
 });
 
-// 5. Обработка любых других типов сообщений (текст, стикеры, голосовые и т.д.)
+// 5. Обработка всех остальных типов сообщений (текст, стикеры, аудио)
 bot.on('message', async (ctx) => {
     await ctx.reply('❌ Пожалуйста, отправьте фотографию или файл изображения.');
 });
@@ -168,6 +197,6 @@ bot.launch(() => {
     console.log('🚀 Робот успешно запущен и готов принимать изображения!');
 });
 
-// Корректная остановка при завершении процесса сервера
+// Корректная остановка при перезапусках сервера Render
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
